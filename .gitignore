@@ -1,0 +1,18 @@
+# Never commit COMSOL binaries or repacked proprietary archives.
+*.jar
+*.jar.*
+*.bak
+*.bak-*
+*.tmp-*
+
+# Local install state and logs.
+install-state.json
+*-state.json
+*.log
+py_scripts/
+
+# Editor/OS files.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
