@@ -144,6 +144,18 @@ try {
         Restore-FileFromBackup -Path ([string]$item.Jar) -Backup ([string]$item.Backup) -Timestamp $timestamp
     }
 
+    $dbUtilJars = @()
+    if ($state.PSObject.Properties.Match("dbUtilJars").Count -gt 0) {
+        $dbUtilJars = @($state.dbUtilJars)
+    }
+    $dbUtilCount = [Math]::Max(1, $dbUtilJars.Count)
+    $index = 0
+    foreach ($item in $dbUtilJars) {
+        $index += 1
+        Write-RollbackProgress -Percent (78 + [int](($index - 1) * (5 / $dbUtilCount))) -Status "Восстановление базы материалов"
+        Restore-FileFromBackup -Path ([string]$item.Jar) -Backup ([string]$item.Backup) -Timestamp $timestamp
+    }
+
     foreach ($item in @($state.prefs)) {
         Write-RollbackProgress -Percent 84 -Status "Восстановление prefs"
         Restore-FileFromBackup -Path ([string]$item.Path) -Backup ([string]$item.Backup) -Timestamp $timestamp

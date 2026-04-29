@@ -152,6 +152,38 @@ function Get-TranslationFiles {
     return $map
 }
 
+function Get-ExistingBackupMap {
+    param(
+        [string]$StatePath,
+        [string]$PropertyName,
+        [string]$KeyProperty
+    )
+
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $StatePath)) {
+        return $map
+    }
+
+    $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($state.PSObject.Properties.Match($PropertyName).Count -lt 1) {
+        return $map
+    }
+
+    foreach ($item in @($state.$PropertyName)) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $key = [string]$item.$KeyProperty
+        $backup = [string]$item.Backup
+        if ($key -and $backup -and (Test-Path -LiteralPath $backup)) {
+            $map[$key] = $backup
+        }
+    }
+
+    return $map
+}
+
 function Find-ResourceJars {
     param([string]$Root)
 
@@ -198,6 +230,29 @@ function Find-UtilJars {
     return $jars
 }
 
+function Find-DbUtilJars {
+    param([string]$Root)
+
+    $folders = @(
+        (Join-Path $Root "plugins"),
+        (Join-Path $Root "web\plugins"),
+        (Join-Path $Root "apiplugins")
+    )
+
+    $jars = @()
+    foreach ($folder in $folders) {
+        if (Test-Path -LiteralPath $folder) {
+            $jars += @(Get-ChildItem -LiteralPath $folder -File -Filter "com.comsol.dbutil_*.jar" | ForEach-Object { $_.FullName })
+        }
+    }
+
+    $jars = @($jars | Sort-Object -Unique)
+    if ($jars.Count -lt 1) {
+        throw "Не найден com.comsol.dbutil_*.jar в COMSOL."
+    }
+    return $jars
+}
+
 function Copy-ZipEntryContent {
     param(
         [System.IO.Compression.ZipArchiveEntry]$SourceEntry,
@@ -235,11 +290,15 @@ function Update-ResourcesJarWithRuLocale {
     param(
         [string]$JarPath,
         [hashtable]$Translations,
-        [string]$Timestamp
+        [string]$Timestamp,
+        [string]$ExistingBackup = ""
     )
 
-    $backupPath = "$JarPath.ru-RU-language-backup-$Timestamp"
-    Copy-Item -LiteralPath $JarPath -Destination $backupPath -Force
+    $backupPath = $ExistingBackup
+    if (-not $backupPath -or -not (Test-Path -LiteralPath $backupPath)) {
+        $backupPath = "$JarPath.ru-RU-language-backup-$Timestamp"
+        Copy-Item -LiteralPath $JarPath -Destination $backupPath -Force
+    }
 
     $tempPath = "$JarPath.tmp-ru-RU-$Timestamp"
     if (Test-Path -LiteralPath $tempPath) {
@@ -301,6 +360,150 @@ function Update-ResourcesJarWithRuLocale {
     }
 }
 
+function Patch-DbLocaleSupportClassBytes {
+    param([byte[]]$Bytes)
+
+    # COMSOL DB supports only built-in locales. ru_RU must fall back to the English DB locale,
+    # otherwise the Materials Browser crashes while initializing com.comsol.guidb.dbsource.r.
+    $original = [byte[]](0xb2, 0x00, 0x37, 0x2a, 0xb9, 0x00, 0x52, 0x02, 0x00, 0xc0, 0x00, 0x1f, 0xb0)
+    $badPatched = [byte[]](0xb2, 0x00, 0x30, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    $patched = [byte[]](0xb2, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb0)
+
+    $originalMatches = @()
+    $badPatchedMatches = @()
+    $patchedMatches = @()
+
+    for ($i = 0; $i -le ($Bytes.Length - $original.Length); $i++) {
+        $matchesOriginal = $true
+        $matchesBadPatched = $true
+        $matchesPatched = $true
+
+        for ($j = 0; $j -lt $original.Length; $j++) {
+            if ($Bytes[$i + $j] -ne $original[$j]) {
+                $matchesOriginal = $false
+            }
+            if ($Bytes[$i + $j] -ne $badPatched[$j]) {
+                $matchesBadPatched = $false
+            }
+            if ($Bytes[$i + $j] -ne $patched[$j]) {
+                $matchesPatched = $false
+            }
+            if (-not $matchesOriginal -and -not $matchesBadPatched -and -not $matchesPatched) {
+                break
+            }
+        }
+
+        if ($matchesOriginal) {
+            $originalMatches += $i
+        }
+        if ($matchesBadPatched) {
+            $badPatchedMatches += $i
+        }
+        if ($matchesPatched) {
+            $patchedMatches += $i
+        }
+    }
+
+    if ($originalMatches.Count -eq 1) {
+        [Array]::Copy($patched, 0, $Bytes, $originalMatches[0], $patched.Length)
+        return [pscustomobject]@{
+            Bytes = $Bytes
+            Changed = 1
+            AlreadyPatched = $false
+        }
+    }
+
+    if ($originalMatches.Count -eq 0 -and $badPatchedMatches.Count -eq 1) {
+        [Array]::Copy($patched, 0, $Bytes, $badPatchedMatches[0], $patched.Length)
+        return [pscustomobject]@{
+            Bytes = $Bytes
+            Changed = 1
+            AlreadyPatched = $false
+        }
+    }
+
+    if ($originalMatches.Count -eq 0 -and $patchedMatches.Count -eq 1) {
+        return [pscustomobject]@{
+            Bytes = $Bytes
+            Changed = 0
+            AlreadyPatched = $true
+        }
+    }
+
+    throw "Не удалось безопасно пропатчить DbLocaleSupport.class: найдено исходных шаблонов $($originalMatches.Count), старых невалидных патчей $($badPatchedMatches.Count), уже пропатченных $($patchedMatches.Count)."
+}
+
+function Update-DbUtilJarLocaleFallback {
+    param([string]$JarPath, [string]$Timestamp, [string]$ExistingBackup = "")
+
+    $entryName = "com/comsol/dbutil/locale/DbLocaleSupport.class"
+    $backupPath = $ExistingBackup
+    if (-not $backupPath -or -not (Test-Path -LiteralPath $backupPath)) {
+        $backupPath = "$JarPath.ru-RU-language-backup-$Timestamp"
+        Copy-Item -LiteralPath $JarPath -Destination $backupPath -Force
+    }
+
+    $tempPath = "$JarPath.tmp-ru-RU-$Timestamp"
+    if (Test-Path -LiteralPath $tempPath) {
+        Remove-Item -LiteralPath $tempPath -Force
+    }
+
+    $changed = 0
+    $alreadyPatched = $false
+    $sawEntry = $false
+    $sourceZip = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
+    try {
+        $targetZip = [System.IO.Compression.ZipFile]::Open($tempPath, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($entry in $sourceZip.Entries) {
+                $newEntry = $targetZip.CreateEntry($entry.FullName, [System.IO.Compression.CompressionLevel]::Optimal)
+                $newEntry.LastWriteTime = $entry.LastWriteTime
+
+                if ($entry.FullName -eq $entryName) {
+                    $sawEntry = $true
+                    $stream = $entry.Open()
+                    try {
+                        $memory = [IO.MemoryStream]::new()
+                        try {
+                            $stream.CopyTo($memory)
+                            $patched = Patch-DbLocaleSupportClassBytes -Bytes $memory.ToArray()
+                            Write-BytesToEntry -Bytes $patched.Bytes -TargetEntry $newEntry
+                            $changed = $patched.Changed
+                            $alreadyPatched = $patched.AlreadyPatched
+                        } finally {
+                            $memory.Dispose()
+                        }
+                    } finally {
+                        $stream.Dispose()
+                    }
+                } else {
+                    Copy-ZipEntryContent -SourceEntry $entry -TargetEntry $newEntry
+                }
+            }
+        } finally {
+            $targetZip.Dispose()
+        }
+    } finally {
+        $sourceZip.Dispose()
+    }
+
+    if (-not $sawEntry) {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force
+        }
+        throw "В $JarPath не найден $entryName."
+    }
+
+    Move-Item -LiteralPath $tempPath -Destination $JarPath -Force
+
+    return [pscustomobject]@{
+        Jar = $JarPath
+        Backup = $backupPath
+        PatchedMethods = $changed
+        AlreadyPatched = $alreadyPatched
+    }
+}
+
 function Read-U2 {
     param([byte[]]$Bytes, [int]$Offset)
     return ((([int]$Bytes[$Offset]) -shl 8) -bor ([int]$Bytes[$Offset + 1]))
@@ -355,11 +558,14 @@ function Patch-FlLocaleClassBytes {
 }
 
 function Update-UtilJarLanguageCandidate {
-    param([string]$JarPath, [string]$Timestamp)
+    param([string]$JarPath, [string]$Timestamp, [string]$ExistingBackup = "")
 
     $entryName = "com/comsol/util/methods/FlLocale.class"
-    $backupPath = "$JarPath.ru-RU-language-backup-$Timestamp"
-    Copy-Item -LiteralPath $JarPath -Destination $backupPath -Force
+    $backupPath = $ExistingBackup
+    if (-not $backupPath -or -not (Test-Path -LiteralPath $backupPath)) {
+        $backupPath = "$JarPath.ru-RU-language-backup-$Timestamp"
+        Copy-Item -LiteralPath $JarPath -Destination $backupPath -Force
+    }
 
     $tempPath = "$JarPath.tmp-ru-RU-$Timestamp"
     if (Test-Path -LiteralPath $tempPath) {
@@ -429,14 +635,17 @@ function Move-OsGiCache {
 }
 
 function Set-PreferenceLocale {
-    param([string]$PrefsPath, [string]$Timestamp)
+    param([string]$PrefsPath, [string]$Timestamp, [string]$ExistingBackup = "")
 
     if (-not (Test-Path -LiteralPath $PrefsPath)) {
         return $null
     }
 
-    $backupPath = "$PrefsPath.ru-RU-language-backup-$Timestamp"
-    Copy-Item -LiteralPath $PrefsPath -Destination $backupPath -Force
+    $backupPath = $ExistingBackup
+    if (-not $backupPath -or -not (Test-Path -LiteralPath $backupPath)) {
+        $backupPath = "$PrefsPath.ru-RU-language-backup-$Timestamp"
+        Copy-Item -LiteralPath $PrefsPath -Destination $backupPath -Force
+    }
 
     $lines = @(Get-Content -LiteralPath $PrefsPath -Encoding UTF8)
     $found = $false
@@ -481,17 +690,28 @@ try {
     Write-SetupProgress -Percent 25 -Status "Загрузка ru_RU переводов"
     $translations = Get-TranslationFiles -Directory $TranslationDir
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $statePath = Join-Path $PSScriptRoot "install-state.json"
+    $existingResourceBackups = Get-ExistingBackupMap -StatePath $statePath -PropertyName "resourceJars" -KeyProperty "Jar"
+    $existingUtilBackups = Get-ExistingBackupMap -StatePath $statePath -PropertyName "utilJars" -KeyProperty "Jar"
+    $existingDbUtilBackups = Get-ExistingBackupMap -StatePath $statePath -PropertyName "dbUtilJars" -KeyProperty "Jar"
+    $existingPrefBackups = Get-ExistingBackupMap -StatePath $statePath -PropertyName "prefs" -KeyProperty "Path"
 
     Write-SetupProgress -Percent 35 -Status "Добавление ru_RU ресурсов"
     $resourceResults = @()
     foreach ($jar in Find-ResourceJars -Root $root) {
-        $resourceResults += Update-ResourcesJarWithRuLocale -JarPath $jar -Translations $translations -Timestamp $timestamp
+        $resourceResults += Update-ResourcesJarWithRuLocale -JarPath $jar -Translations $translations -Timestamp $timestamp -ExistingBackup $existingResourceBackups[$jar]
     }
 
     Write-SetupProgress -Percent 62 -Status "Добавление ru_RU в список языков"
     $utilResults = @()
     foreach ($jar in Find-UtilJars -Root $root) {
-        $utilResults += Update-UtilJarLanguageCandidate -JarPath $jar -Timestamp $timestamp
+        $utilResults += Update-UtilJarLanguageCandidate -JarPath $jar -Timestamp $timestamp -ExistingBackup $existingUtilBackups[$jar]
+    }
+
+    Write-SetupProgress -Percent 70 -Status "Настройка базы материалов"
+    $dbUtilResults = @()
+    foreach ($jar in Find-DbUtilJars -Root $root) {
+        $dbUtilResults += Update-DbUtilJarLocaleFallback -JarPath $jar -Timestamp $timestamp -ExistingBackup $existingDbUtilBackups[$jar]
     }
 
     $prefResults = @()
@@ -499,10 +719,13 @@ try {
         Write-SetupProgress -Percent 78 -Status "Выбор ru_RU в настройках"
         $userVersion = Get-ComsolUserVersion -Root $root
         if ($userVersion) {
-            $prefResults += Set-PreferenceLocale -PrefsPath (Join-Path $env:USERPROFILE ".comsol\$userVersion\comsol.prefs") -Timestamp $timestamp
-            $prefResults += Set-PreferenceLocale -PrefsPath (Join-Path $env:USERPROFILE ".comsol\$userVersion\comsolserver.prefs") -Timestamp $timestamp
+            $prefsPath = Join-Path $env:USERPROFILE ".comsol\$userVersion\comsol.prefs"
+            $prefResults += Set-PreferenceLocale -PrefsPath $prefsPath -Timestamp $timestamp -ExistingBackup $existingPrefBackups[$prefsPath]
+            $prefsPath = Join-Path $env:USERPROFILE ".comsol\$userVersion\comsolserver.prefs"
+            $prefResults += Set-PreferenceLocale -PrefsPath $prefsPath -Timestamp $timestamp -ExistingBackup $existingPrefBackups[$prefsPath]
         }
-        $prefResults += Set-PreferenceLocale -PrefsPath (Join-Path $root "comsol.prefs") -Timestamp $timestamp
+        $prefsPath = Join-Path $root "comsol.prefs"
+        $prefResults += Set-PreferenceLocale -PrefsPath $prefsPath -Timestamp $timestamp -ExistingBackup $existingPrefBackups[$prefsPath]
         $prefResults = @($prefResults | Where-Object { $_ -ne $null })
     }
 
@@ -513,7 +736,6 @@ try {
     }
 
     Write-SetupProgress -Percent 95 -Status "Сохранение состояния"
-    $statePath = Join-Path $PSScriptRoot "install-state.json"
     $state = [ordered]@{
         installedAt = (Get-Date).ToString("s")
         comsolRoot = $root
@@ -521,6 +743,7 @@ try {
         translationDir = (Resolve-Path -LiteralPath $TranslationDir).Path
         resourceJars = $resourceResults
         utilJars = $utilResults
+        dbUtilJars = $dbUtilResults
         prefs = $prefResults
         cacheBackup = $cacheBackup
     }
@@ -534,6 +757,7 @@ try {
     Write-Host "В списке языков должен появиться Russian/Русский, отдельный от штатных языков." -ForegroundColor Green
     Write-Host "Ресурсные JAR обновлены: $($resourceResults.Count)"
     Write-Host "JAR со списком языков пропатчены: $($utilResults.Count)"
+    Write-Host "JAR базы материалов пропатчены: $($dbUtilResults.Count)"
     Write-Host "Файл состояния: $statePath"
     Write-Host "Перезапустите COMSOL и проверьте Language."
 } catch {
